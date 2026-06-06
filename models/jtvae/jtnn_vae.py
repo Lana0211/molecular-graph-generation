@@ -27,12 +27,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Tuple, Optional
 
+from rdkit import Chem
+
 from models.jtvae.mol_tree import MolTree, Vocab, MolTreeNode
 from models.jtvae.mpn import MPN, index_select_ND, ATOM_FDIM, BOND_FDIM
+from models.jtvae.chemutils import get_mol, enum_assemble
+
+
+class _AssemblyNode:
+    """Minimal node exposing the ``.mol`` / ``.nid`` attributes that the
+    junction-tree graph decoder (chemutils.enum_assemble) expects."""
+
+    __slots__ = ("mol", "nid")
+
+    def __init__(self, mol, nid: int):
+        self.mol = mol
+        self.nid = nid
 
 
 # ---------------------------------------------------------------------------
-# Iterative DFS helper (avoids Python's recursion limit on deep/cyclic trees)
+# Tree encoder: vectorized GCN-style message passing over the junction tree
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -248,18 +262,24 @@ class JTVAE(nn.Module):
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def generate(self, n: int = 1, max_nodes: int = 4,
-                 temperature: float = 1.2) -> List[str]:
-        """Sample latent vectors from the prior N(0,1) and decode to SMILES."""
+    def generate(self, n: int = 1, max_nodes: int = 12,
+                 temperature: float = 1.2, assembler: str = "fusion") -> List[str]:
+        """Sample latent vectors from the prior N(0,1) and decode to SMILES.
+
+        assembler: "fusion" (junction-tree graph decoder via enum_assemble,
+        the default) or "single_bond" (the simple one-bond baseline, kept for
+        ablation).
+        """
         device = next(self.parameters()).device
         self.eval()
         z = torch.randn(n, self.latent_dim, device=device)   # sample from prior
-        return self._decode_z(z, max_nodes, temperature)
+        return self._decode_z(z, max_nodes, temperature, assembler)
 
     @torch.no_grad()
     def _decode_z(self, z: torch.Tensor,
-                  max_nodes: int = 4,
-                  temperature: float = 1.0) -> List[str]:
+                  max_nodes: int = 12,
+                  temperature: float = 1.0,
+                  assembler: str = "fusion") -> List[str]:
         """Decode a batch of latent vectors into SMILES strings."""
         device     = z.device
         results    = []
@@ -284,32 +304,37 @@ class JTVAE(nn.Module):
                 wids.append(int(next_wid))
                 cur_wid = int(next_wid)
 
-            results.append(self._wids_to_smiles(wids))
+            results.append(self._wids_to_smiles(wids, assembler=assembler))
 
         return results
 
-    def _wids_to_smiles(self, wids: List[int], max_frags: int = 8) -> str:
+    def _wids_to_smiles(self, wids: List[int], max_frags: int = 12,
+                        assembler: str = "fusion") -> str:
         """Assemble a connected molecule from a sequence of vocab cluster indices.
 
-        Instead of joining clusters with '.' (which yields disconnected,
-        non-drug-like fragments), this greedily bonds each cluster to the
-        growing molecule with a single bond between two atoms that have a free
-        valence (an implicit hydrogen).  RDKit re-sanitisation then removes one
-        H from each, producing a chemically valid, connected molecule.
+        Sequential greedy assembly: each cluster is glued onto the growing
+        molecule one at a time.  Two assemblers are available:
 
-        The original JTVAE uses explicit attachment-site matching; this is a
-        pragmatic approximation that still yields realistic drug-like sizes.
+          "fusion"      – the junction-tree graph decoder (chemutils.enum_assemble):
+                          enumerates every chemically valid attachment (single-atom
+                          share *or* whole-bond ring fusion) and picks one at random
+                          for diversity.  Produces realistic fused-ring scaffolds.
+          "single_bond" – the simple baseline: one fresh single bond between two
+                          free-valence atoms (cannot fuse rings).  Kept for ablation.
+
+        Disconnected results ('.' in SMILES) are rejected to preserve 100% validity.
         """
-        from rdkit import Chem
         if not wids:
             return ""
 
-        # Parse cluster SMILES; cap fragment count to keep molecules drug-sized
-        mols = []
-        for w in wids[:max_frags]:
-            m = Chem.MolFromSmiles(self.vocab.get_smiles(w))
-            if m is not None:
-                mols.append(m)
+        # Parse cluster SMILES (kekulized), memoised within this call
+        cache = {}
+        def cluster_mol(w):
+            if w not in cache:
+                cache[w] = get_mol(self.vocab.get_smiles(w))
+            return cache[w]
+
+        mols = [m for m in (cluster_mol(w) for w in wids[:max_frags]) if m is not None]
         if not mols:
             return ""
         if len(mols) == 1:
@@ -317,31 +342,35 @@ class JTVAE(nn.Module):
 
         current = mols[0]
         for frag in mols[1:]:
-            current = self._bond_fragments(current, frag) or current
+            if assembler == "single_bond":
+                current = self._bond_fragments(current, frag) or current
+            else:
+                center = _AssemblyNode(current, nid=0)
+                nei    = _AssemblyNode(frag,    nid=1)
+                cands  = enum_assemble(center, [nei])
+                if cands:                       # skip clusters that cannot attach
+                    _, current, _ = random.choice(cands)
 
         try:
             Chem.SanitizeMol(current)
             smi = Chem.MolToSmiles(current)
-            # Reject if assembly left disconnected components
-            return smi if "." not in smi else ""
+            return smi if "." not in smi else ""   # reject disconnected assemblies
         except Exception:
             return ""
 
     @staticmethod
     def _bond_fragments(mol_a, mol_b):
-        """Join two molecules with one single bond between free-valence atoms.
+        """Single-bond baseline assembler (ablation): join two molecules with one
+        single bond between random free-valence atoms.  Cannot fuse rings.
 
         Returns the sanitised combined molecule, or None if no valid bond
         could be formed.
         """
-        from rdkit import Chem
-
         def first_open_atom(mol, lo, hi):
             """Random atom in [lo, hi) that has at least one implicit H.
 
-            Randomising the attachment point is critical for structural diversity:
-            always picking index 0 collapses all assemblies to the same topology
-            (spiro / heavily-fused rings), hurting uniqueness and FCD.
+            Randomising the attachment point matters for diversity: always
+            picking index 0 collapses all assemblies to the same topology.
             """
             candidates = [idx for idx in range(lo, hi)
                           if mol.GetAtomWithIdx(idx).GetTotalNumHs() > 0]

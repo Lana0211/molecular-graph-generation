@@ -31,7 +31,7 @@ The notebook downloads the dataset automatically and runs all five sections
 
 **Smart caching** — every training/generation cell checks for an existing
 checkpoint or CSV and *loads it instead of recomputing*. So a fresh clone trains
-both models once (~30 min for JTVAE on GPU); re-running afterwards is near-instant.
+both models once (~1 hr for JTVAE on GPU); re-running afterwards is near-instant.
 
 ### Re-training from scratch
 
@@ -124,8 +124,6 @@ final_project/
 │   └── metrics.py           # All MOSES-compatible metrics
 ├── optimization/
 │   └── property_optimize.py # Latent space optimization (BO / gradient)
-├── visualization/
-│   └── visualize.py         # Plotting utilities
 ├── notebooks/
 │   └── molecular_generation.ipynb   # all-in-one notebook (sections 1–5)
 ├── results/                 # Generated outputs (checkpoints, CSVs, figures)
@@ -178,7 +176,7 @@ python -m optimization.property_optimize --ckpt results/jtvae/jtvae_best.pt --me
 | Data download & preprocessing | ~10 min |
 | Vocab building (50k molecules) | ~5 min |
 | CharRNN training (30 epochs) | ~30 min |
-| JTVAE training (30 epochs, 80k samples) | ~2–3 hr |
+| JTVAE training (30 epochs, 80k samples, free_bits) | ~1 hr |
 | Property optimization (50 BO iterations) | ~15 min |
 
 ---

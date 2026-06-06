@@ -271,12 +271,16 @@ def main(args):
 
     os.makedirs(args.save_dir, exist_ok=True)
     history   = []
-    best_loss = float("inf")
+    # Checkpoint on reconstruction loss, not total loss: with KL annealing the
+    # total loss is artificially lowest during the beta=0 warmup, so selecting on
+    # it would persist a pre-regularization (collapsed) model.
+    best_rec = float("inf")
 
     for epoch in range(1, args.epochs + 1):
         beta     = anneal_beta(epoch, args.epochs, args.beta, warmup=args.warmup)
         t0       = time.time()
-        tr_stats = train_one_epoch(model, train_loader, optimizer, device, beta)
+        tr_stats = train_one_epoch(model, train_loader, optimizer, device, beta,
+                                   free_bits=args.free_bits)
         scheduler.step()
 
         print(
@@ -288,9 +292,11 @@ def main(args):
         )
         history.append({"epoch": epoch, "beta": beta, **tr_stats})
 
-        # Save the best model by total training loss
-        if tr_stats["loss"] < best_loss:
-            best_loss = tr_stats["loss"]
+        # Save the best model by reconstruction loss, but only after warmup:
+        # during the beta=0 warmup the latent is unregularized, so rec_loss is
+        # artificially low and would persist a pre-regularization (collapsed) model.
+        if epoch > args.warmup and tr_stats["rec_loss"] < best_rec:
+            best_rec = tr_stats["rec_loss"]
             ckpt = os.path.join(args.save_dir, "jtvae_best.pt")
             torch.save({"epoch": epoch, "model_state": model.state_dict(),
                         "vocab": vocab, "args": vars(args)}, ckpt)
@@ -320,6 +326,9 @@ if __name__ == "__main__":
     p.add_argument("--depth_g",      type=int,   default=3)
     p.add_argument("--lr",           type=float, default=1e-3)
     p.add_argument("--beta",         type=float, default=1.0)
+    p.add_argument("--free_bits",    type=float, default=0.5,
+                   help="Minimum KL nats per latent dim (Kingma et al. 2016). "
+                        "Prevents posterior collapse; 0 disables.")
     p.add_argument("--warmup",       type=int,   default=5)
     p.add_argument("--subset",       type=int,   default=0,
                    help="Use only this many training samples (0 = all)")

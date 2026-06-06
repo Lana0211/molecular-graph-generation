@@ -15,22 +15,17 @@ from collections import deque
 from typing import Dict, List, Tuple, Optional
 
 from rdkit import Chem
-from rdkit.Chem import AllChem
 import copy
 
 
 # ---------------------------------------------------------------------------
-# Constants used by the original JTVAE (kept for reference)
+# Constants
 # ---------------------------------------------------------------------------
 
-MST_MAX_WEIGHT = 100   # maximum spanning tree edge weight threshold
-MAX_NCANDS     = 2000  # maximum candidate attachments to evaluate
-
-# Allowed valences per element (used to filter invalid attachment candidates)
-VALENCE_MAP = {
-    "C": [4], "N": [3, 5], "O": [2], "S": [2, 4, 6],
-    "P": [3, 5], "F": [1], "Cl": [1], "Br": [1], "I": [1],
-}
+# Cap on candidate attachment configurations enumerated per assembly step.
+# Keeps generation fast on pathological clusters; value follows the original
+# JTVAE (wengong-jin/icml18-jtnn).
+MAX_NCAND = 2000
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +164,7 @@ def _bfs_spanning_tree(
 
 
 # ---------------------------------------------------------------------------
-# Atom / molecule copying and attachment helpers
+# Atom / molecule copying helpers
 # ---------------------------------------------------------------------------
 
 def atom_equal(a1: Chem.Atom, a2: Chem.Atom) -> bool:
@@ -178,18 +173,30 @@ def atom_equal(a1: Chem.Atom, a2: Chem.Atom) -> bool:
             a1.GetFormalCharge() == a2.GetFormalCharge())
 
 
-def bond_match(mol1: Chem.Mol, a1: int, b1: int,
-               mol2: Chem.Mol, a2: int, b2: int) -> bool:
-    """Return True if the corresponding bonds in mol1 and mol2 have the same type."""
-    return (mol1.GetBondBetweenAtoms(a1, b1).GetBondType() ==
-            mol2.GetBondBetweenAtoms(a2, b2).GetBondType())
+def ring_bond_equal(b1: Chem.Bond, b2: Chem.Bond, reverse: bool = False) -> bool:
+    """Two ring bonds match if their end atoms are pairwise equivalent.
+
+    Bond *type* is intentionally ignored: clusters are kekulized inconsistently
+    across the vocabulary, so matching on atom identity (and optionally the
+    reversed orientation) is what lets two rings fuse along a shared edge.
+    """
+    b1 = (b1.GetBeginAtom(), b1.GetEndAtom())
+    if reverse:
+        b2 = (b2.GetEndAtom(), b2.GetBeginAtom())
+    else:
+        b2 = (b2.GetBeginAtom(), b2.GetEndAtom())
+    return atom_equal(b1[0], b2[0]) and atom_equal(b1[1], b2[1])
 
 
 def copy_atom(atom: Chem.Atom) -> Chem.Atom:
-    """Create a new RDKit Atom with the same symbol, charge, and explicit H count."""
+    """Create a new RDKit Atom copying symbol, formal charge, and atom-map number.
+
+    Explicit hydrogens are deliberately *not* copied — implicit valence is
+    recomputed by RDKit during sanitization after the new bonds are added.
+    """
     new_atom = Chem.Atom(atom.GetSymbol())
     new_atom.SetFormalCharge(atom.GetFormalCharge())
-    new_atom.SetNumExplicitHs(atom.GetNumExplicitHs())
+    new_atom.SetAtomMapNum(atom.GetAtomMapNum())
     return new_atom
 
 
@@ -204,39 +211,173 @@ def copy_edit_mol(mol: Chem.Mol) -> Chem.RWMol:
     return new_mol
 
 
-def get_inter_label(mol: Chem.Mol, a_idx: int, inter_atoms: List[int]) -> str:
-    """Return a SMILES label that highlights the inter-clique attachment atom."""
-    new_mol = copy_edit_mol(mol)
-    for atom in new_mol.GetAtoms():
-        if atom.GetIdx() not in inter_atoms:
-            atom.SetAtomMapNum(0)               # clear map numbers for non-inter atoms
-    new_mol.GetAtomWithIdx(a_idx).SetAtomMapNum(1)   # mark the attachment atom
-    return Chem.MolToSmiles(new_mol.GetMol())
+# ---------------------------------------------------------------------------
+# Junction-tree graph decoder: enumerate and materialise cluster attachments
+#
+# Faithful port of the assembly routines from the original JTVAE
+# (wengong-jin/icml18-jtnn).  Given a center cluster and its neighbour
+# cluster(s), enum_attach lists every chemically plausible way to glue them
+# together — by sharing a single atom or by fusing a whole bond (ring fusion) —
+# and enum_assemble materialises, sanitizes, and de-duplicates the candidates.
+# This is what produces realistic fused-ring scaffolds (indole, quinoline, …)
+# that a single inter-cluster bond can never form.
+# ---------------------------------------------------------------------------
 
+def enum_attach(ctr_mol: Chem.Mol, nei_node, amap: list, singletons: list) -> list:
+    """Enumerate attachment configurations between ``ctr_mol`` and one neighbour.
 
-def enum_attach(cand_mol: Chem.Mol, nei_node_mol: Chem.Mol,
-                nei_atom: int, att_atom: int) -> List[Chem.Mol]:
-    """Enumerate chemically valid ways to attach a neighbour node to a candidate.
-
-    Returns a list of sanitised product molecules (one per valid bond type).
+    Each configuration is an ``amap``: a list of ``(nei_id, ctr_atom_idx,
+    nei_atom_idx)`` triples mapping neighbour atoms onto center atoms.  Three
+    neighbour shapes are handled: singleton atom, single bond, and ring
+    (atom-share *and* bond-share / fusion).
     """
-    cand_atom = cand_mol.GetAtomWithIdx(att_atom)
-    nei_a     = nei_node_mol.GetAtomWithIdx(nei_atom)
+    nei_mol, nei_idx = nei_node.mol, nei_node.nid
+    att_confs = []
 
-    if not atom_equal(cand_atom, nei_a):
-        return []   # attachment atom types must match
+    # Atoms already claimed by a singleton neighbour cannot be reused
+    black_list = [atom_idx for nei_id, atom_idx, _ in amap if nei_id in singletons]
+    ctr_atoms  = [a for a in ctr_mol.GetAtoms() if a.GetIdx() not in black_list]
+    ctr_bonds  = list(ctr_mol.GetBonds())
 
-    # Collect existing bond types from the candidate attachment atom
-    bond_types = [bond.GetBondType() for bond in cand_atom.GetBonds()]
-    results    = []
-    for btype in bond_types:
-        new_mol = copy_edit_mol(cand_mol)
+    if nei_mol.GetNumBonds() == 0:                      # neighbour is a singleton atom
+        nei_atom  = nei_mol.GetAtomWithIdx(0)
+        used_list = [atom_idx for _, atom_idx, _ in amap]
+        for atom in ctr_atoms:
+            if atom_equal(atom, nei_atom) and atom.GetIdx() not in used_list:
+                att_confs.append(amap + [(nei_idx, atom.GetIdx(), 0)])
+
+    elif nei_mol.GetNumBonds() == 1:                    # neighbour is a single bond
+        bond     = nei_mol.GetBondWithIdx(0)
+        bond_val = int(bond.GetBondTypeAsDouble())
+        b1, b2   = bond.GetBeginAtom(), bond.GetEndAtom()
+        for atom in ctr_atoms:
+            # A carbon without enough free valence cannot take the bond
+            if atom.GetAtomicNum() == 6 and atom.GetTotalNumHs() < bond_val:
+                continue
+            if atom_equal(atom, b1):
+                att_confs.append(amap + [(nei_idx, atom.GetIdx(), b1.GetIdx())])
+            elif atom_equal(atom, b2):
+                att_confs.append(amap + [(nei_idx, atom.GetIdx(), b2.GetIdx())])
+
+    else:                                               # neighbour is a ring
+        # (a) share a single atom
+        for a1 in ctr_atoms:
+            for a2 in nei_mol.GetAtoms():
+                if atom_equal(a1, a2):
+                    if a1.GetAtomicNum() == 6 and \
+                       a1.GetTotalNumHs() + a2.GetTotalNumHs() < 4:
+                        continue
+                    att_confs.append(amap + [(nei_idx, a1.GetIdx(), a2.GetIdx())])
+        # (b) fuse along a shared bond (in both orientations)
+        if ctr_mol.GetNumBonds() > 1:
+            for b1 in ctr_bonds:
+                for b2 in nei_mol.GetBonds():
+                    if ring_bond_equal(b1, b2):
+                        att_confs.append(amap + [
+                            (nei_idx, b1.GetBeginAtom().GetIdx(), b2.GetBeginAtom().GetIdx()),
+                            (nei_idx, b1.GetEndAtom().GetIdx(),   b2.GetEndAtom().GetIdx()),
+                        ])
+                    if ring_bond_equal(b1, b2, reverse=True):
+                        att_confs.append(amap + [
+                            (nei_idx, b1.GetBeginAtom().GetIdx(), b2.GetEndAtom().GetIdx()),
+                            (nei_idx, b1.GetEndAtom().GetIdx(),   b2.GetBeginAtom().GetIdx()),
+                        ])
+
+        if len(att_confs) > MAX_NCAND:
+            att_confs = att_confs[:MAX_NCAND]       # cap pathological ring blow-ups
+    return att_confs
+
+
+def attach_mols(ctr_mol: Chem.RWMol, neighbors: list, prev_nodes: list,
+                nei_amap: dict) -> Chem.RWMol:
+    """Splice neighbour atoms/bonds into ``ctr_mol`` according to ``nei_amap``."""
+    prev_nids = [node.nid for node in prev_nodes]
+    for nei_node in prev_nodes + neighbors:
+        nei_id, nei_mol = nei_node.nid, nei_node.mol
+        amap = nei_amap[nei_id]
+        # Add neighbour atoms that are not already shared with the center
+        for atom in nei_mol.GetAtoms():
+            if atom.GetIdx() not in amap:
+                amap[atom.GetIdx()] = ctr_mol.AddAtom(copy_atom(atom))
+
+        if nei_mol.GetNumBonds() == 0:                  # singleton: carry map number
+            nei_atom = nei_mol.GetAtomWithIdx(0)
+            ctr_mol.GetAtomWithIdx(amap[0]).SetAtomMapNum(nei_atom.GetAtomMapNum())
+        else:
+            for bond in nei_mol.GetBonds():
+                a1 = amap[bond.GetBeginAtom().GetIdx()]
+                a2 = amap[bond.GetEndAtom().GetIdx()]
+                if ctr_mol.GetBondBetweenAtoms(a1, a2) is None:
+                    ctr_mol.AddBond(a1, a2, bond.GetBondType())
+                elif nei_id in prev_nids:               # parent node wins on conflict
+                    ctr_mol.RemoveBond(a1, a2)
+                    ctr_mol.AddBond(a1, a2, bond.GetBondType())
+    return ctr_mol
+
+
+def local_attach(ctr_mol: Chem.Mol, neighbors: list, prev_nodes: list,
+                 amap_list: list) -> Chem.Mol:
+    """Materialise the molecule obtained by applying ``amap_list`` to ``ctr_mol``."""
+    ctr_mol  = copy_edit_mol(ctr_mol)
+    nei_amap = {nei.nid: {} for nei in prev_nodes + neighbors}
+    for nei_id, ctr_atom, nei_atom in amap_list:
+        nei_amap[nei_id][nei_atom] = ctr_atom
+    ctr_mol = attach_mols(ctr_mol, neighbors, prev_nodes, nei_amap)
+    return ctr_mol.GetMol()
+
+
+def enum_assemble(node, neighbors: list, prev_nodes: list = None,
+                  prev_amap: list = None) -> list:
+    """Enumerate, sanitize, and de-duplicate ways to assemble ``node``.
+
+    Returns a list of ``(smiles, mol, amap)`` candidate assemblies of the center
+    ``node`` with its ``neighbors`` (each a lightweight object exposing ``.mol``
+    and ``.nid``).  Rings are tried first for speed.  Bounded by ``MAX_NCAND``.
+    """
+    prev_nodes = prev_nodes or []
+    prev_amap  = prev_amap or []
+    all_attach_confs = []
+    singletons = [nei.nid for nei in neighbors + prev_nodes
+                  if nei.mol.GetNumAtoms() == 1]
+
+    def search(cur_amap, depth):
+        if len(all_attach_confs) > MAX_NCAND:
+            return
+        if depth == len(neighbors):
+            all_attach_confs.append(cur_amap)
+            return
+        nei_node  = neighbors[depth]
+        cand_amap = enum_attach(node.mol, nei_node, cur_amap, singletons)
+        seen      = set()
+        viable    = []
+        for amap in cand_amap:
+            cand = local_attach(node.mol, neighbors[:depth + 1], prev_nodes, amap)
+            cand = sanitize(cand)
+            if cand is None:
+                continue
+            smi = get_smiles(cand)
+            if smi in seen:
+                continue
+            seen.add(smi)
+            viable.append(amap)
+        for new_amap in viable:
+            search(new_amap, depth + 1)
+
+    search(prev_amap, 0)
+
+    candidates, seen = [], set()
+    for amap in all_attach_confs:
+        cand = local_attach(node.mol, neighbors, prev_nodes, amap)
         try:
-            new_mol.AddBond(att_atom, cand_mol.GetNumAtoms(), btype)
-            new_mol.AddAtom(copy_atom(nei_a))
-            mol = sanitize(new_mol.GetMol())
-            if mol:
-                results.append(mol)
+            cand = Chem.MolFromSmiles(Chem.MolToSmiles(cand))
+            if cand is None:
+                continue
+            smi = Chem.MolToSmiles(cand)
+            if smi in seen:
+                continue
+            seen.add(smi)
+            Chem.Kekulize(cand)
         except Exception:
-            pass   # skip invalid attachment attempts silently
-    return results
+            continue
+        candidates.append((smi, cand, amap))
+    return candidates
