@@ -98,7 +98,32 @@ with a free valence. This is the direct cause of two observations in our results
 
 ---
 
-## 6. Results Summary (random samples from the prior)
+## 6. Why We Do Not Report Reconstruction Accuracy
+
+The original paper reports **reconstruction accuracy** (76.7%): encode a molecule
+`m` to `z`, decode it back, and measure how often the result is *exactly* `m`.
+We deliberately omit this metric, for a principled reason tied to simplification
+4 (the graph decoder) above.
+
+Faithful reconstruction requires the decoder to use the graph latent `z_G` to
+recover the **exact attachment configuration** between clusters. Our simplified
+graph decoder does **not** consume `z_G` — it joins clusters with a heuristic
+single bond at the first free-valence atom. As a result, even with the correct
+latent `z`, the decoded molecule's connectivity generally differs from the
+original, so an "exact-match" reconstruction score is not a meaningful measure of
+our model. (This is the same root cause behind the observed KL collapse and the
+very low scaffold similarity.)
+
+Instead, we evaluate the property that our model *can* meaningfully deliver —
+**distributional quality of prior samples** — via the MOSES metric suite below
+(validity, novelty, FCD, QED/LogP distributions, etc.). The **FCD** metric in
+particular (Fréchet ChemNet Distance) captures how close the entire generated
+distribution is to real molecules, serving a complementary role to the paper's
+reconstruction check.
+
+---
+
+## 7. Results Summary (random samples from the prior)
 
 | Metric | CharRNN (baseline) | JTVAE (ours) | Real drugs (target) |
 |--------|:---:|:---:|:---:|
