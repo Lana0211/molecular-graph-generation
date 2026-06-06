@@ -66,9 +66,11 @@ result, delete the relevant file(s) under `results/` before running the cell:
 | Model | Type | Architecture |
 |-------|------|-------------|
 | CharRNN | Sequence-based | 3-layer GRU, character-level SMILES |
-| **JTVAE** | Graph-based | Junction Tree VAE (encoder: Tree-LSTM + MPN; decoder: auto-regressive) |
+| **JTVAE** | Graph-based | Junction Tree VAE (encoder: Tree-LSTM + MPN; decoder: auto-regressive + enum_assemble) |
 
-**Key idea**: JTVAE decomposes each molecule into a *junction tree* of ring systems and bonds, then learns to encode/decode this structured representation. By generating the tree first and filling in local chemistry second, the decoder produces chemically valid molecules by construction.
+**Key idea**: JTVAE decomposes each molecule into a *junction tree* of ring systems and bonds, then learns to encode/decode this structured representation. The decoder generates a sequence of cluster IDs, which are then assembled into a full molecule using `enum_assemble` — a ring-fusion algorithm that enumerates all chemically valid cluster attachments (including shared bonds between rings).
+
+**Property optimization**: After training, we run gradient ascent in the JTVAE latent space to maximise QED (drug-likeness). A small proxy MLP is trained on encoded seed molecules, then gradient steps push latent vectors toward higher predicted QED. On 200 seed molecules: mean ΔQED = +0.076, hit rate = 53%.
 
 > **How this relates to the original JTVAE paper** (faithful parts vs. our
 > simplifications, and an honest results discussion) is documented in
@@ -99,6 +101,19 @@ result, delete the relevant file(s) under `results/` before running the cell:
 | QED | Drug-likeness (0–1) |
 | SA | Synthetic accessibility (1–10) |
 | LogP | Lipophilicity |
+
+### Key Results
+
+| Metric | CharRNN | JTVAE (single-bond) | JTVAE (enum_assemble) |
+| ------ | ------- | ------------------- | --------------------- |
+| Validity | 0.9795 | 1.0000 | **1.0000** |
+| Uniqueness | 0.9996 | 1.0000 | **1.0000** |
+| Novelty | 0.8433 | 1.0000 | **1.0000** |
+| Internal Diversity | 0.8664 | 0.8650 | **0.9016** |
+| FCD (↓) | **0.182** | 33.25 | 20.27 |
+| QED | **0.802** | 0.467 | 0.587 |
+
+JTVAE-SB = single-bond assembler (ablation baseline); JTVAE (enum_assemble) is our main model. The ablation confirms ring-fusion assembly reduces FCD by 39% vs single-bond on the same checkpoint.
 
 ---
 

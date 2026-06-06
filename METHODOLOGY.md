@@ -15,7 +15,7 @@ project (training budget of a few hours on a single GPU).
 ## 1. What the Paper Does
 
 | Aspect | Original JTVAE (Jin et al., 2018) |
-|--------|-----------------------------------|
+| ------ | --------------------------------- |
 | **Dataset** | ZINC, ~250K drug-like molecules, with the train/test split from Kusner et al. (2017). Vocabulary built from 240K molecules. |
 | **Problem** | Generate molecular **graphs directly** instead of SMILES strings, to overcome two SMILES weaknesses: (1) similar molecules can have very different SMILES, preventing smooth embeddings; (2) character-by-character generation passes through chemically invalid intermediate states. |
 | **Preprocessing** | Tree decomposition of every molecule into a junction tree of clusters (rings + single bonds). Cluster vocabulary size **\|X\| = 780**. Atom features: type, degree, formal charge, chirality. Bond features: bond type, in-ring flag, cis/trans. |
@@ -33,14 +33,14 @@ reconstruction.
 ## 2. What Our Implementation Does
 
 | Aspect | Our implementation |
-|--------|--------------------|
+| ------ | ------------------ |
 | **Dataset** | ZINC via the **MOSES benchmark** (`dataset_v1.csv`). We subsample **80K** molecules for training. MOSES has already applied drug-likeness filtering upstream. |
 | **Problem** | Same: graph-based generation (JTVAE) vs a sequence baseline (CharRNN). |
 | **Preprocessing** | Tree decomposition, cluster vocabulary **\|X\| = 287** (from 50K molecules), kekulization validation, out-of-vocabulary filtering. Atom/bond features follow the paper exactly. |
 | **Encoder** | Tree encoder + graph encoder (MPN), combined as `z = (z_T + z_G) / 2`. |
 | **Tree encoder** | Vectorized **synchronous GCN** message passing (not the paper's bottom-up+top-down GRU schedule). |
-| **Decoder** | GRU predicts a **sequence of cluster ids**, then a **heuristic single-bond assembly** joins clusters at free-valence atoms. |
-| **Validation** | 8 **MOSES** metrics (validity, uniqueness, novelty, internal diversity, SNN, scaffold similarity, FCD, plus QED/SA/LogP distributions) + latent-space property optimization + t-SNE latent visualization. |
+| **Decoder** | GRU predicts a **sequence of cluster ids**, then `enum_assemble` (ported from Jin et al.'s original code) joins clusters by enumerating valid atom-share and ring bond-fusion attachments, selecting randomly among valid candidates. |
+| **Validation** | 8 **MOSES** metrics (validity, uniqueness, novelty, internal diversity, SNN, scaffold similarity, FCD, plus QED/SA/LogP distributions) + assembler ablation (single-bond vs enum_assemble, same checkpoint) + latent-space property optimization (gradient ascent, QED proxy) + t-SNE latent visualization. |
 | **Baseline** | **CharRNN** — a character-level GRU over SMILES, equivalent in spirit to the paper's CVAE baseline. |
 
 ---
@@ -66,21 +66,23 @@ reconstruction.
 ## 4. Where We Deliberately Simplified (and Why)
 
 | # | Paper | Ours | Reason |
-|---|-------|------|--------|
+| - | ----- | ---- | ------ |
 | 1 | Latent = **concatenation** `[z_T, z_G]` | Latent = **average** `(z_T + z_G)/2` | Simpler bottleneck; fewer parameters. |
 | 2 | Tree encoder: **GRU**, bottom-up + top-down schedule | **Synchronous GCN** (a few large tensor ops) | ~50× faster per epoch; avoids thousands of tiny per-node GPU kernels. |
 | 3 | Tree decoder: separate **topological + label** prediction | Single **next-cluster** GRU prediction | Simpler sequence model. |
-| 4 | **Graph decoder with attachment scoring** (the core contribution) | **Heuristic single-bond assembly** at free-valence atoms | A full attachment-scoring decoder is substantial to implement and train; the heuristic still yields connected, valid, drug-like molecules. |
+| 4 | **Graph decoder with attachment scoring** using `z_G` to score candidates | `enum_assemble` enumerates valid attachments (atom-share + ring bond-fusion, ported from original code) but **selects randomly** among valid candidates — no learned `z_G`-conditioned scoring | Porting the enumeration is already substantial; training the scorer would require a separate graph-matching network. |
 
-**Most important difference (#4).** The paper's graph decoder uses `z_G` to
-decide *exactly how* neighbouring clusters attach, which is what makes
-reconstruction faithful and validity guaranteed. Our heuristic assembly ignores
-the fine-grained `z_G` connectivity and simply bonds clusters at the first atom
-with a free valence. This is the direct cause of two observations in our results:
+**Most important remaining difference (#4).** The paper's graph decoder uses `z_G` to
+*score* each candidate attachment and pick the best one, which is what makes
+reconstruction faithful. Our implementation enumerates the same candidates using
+the original `enum_assemble` logic (enabling ring fusion), but selects randomly
+rather than by score. This means `z_G` still has limited influence on the final
+molecule — which explains two observations in our results:
 
-- **Low scaffold similarity** — assembled scaffolds differ from the training set.
-- **Limited benefit from `z_G` / KL collapse** — since assembly does not consume
-  `z_G`, the graph-latent contributes little after KL annealing.
+- **Low scaffold similarity for enum_assemble** — random selection among ring fusions creates
+  structurally novel scaffolds not seen in ZINC, pushing scaffold similarity to 0.03.
+- **FCD still high vs CharRNN** — the molecular property distribution doesn't perfectly
+  match ZINC because assembly is unguided.
 
 ---
 
@@ -123,23 +125,32 @@ reconstruction check.
 
 ---
 
-## 7. Results Summary (random samples from the prior)
+## 7. Results Summary
 
-| Metric | CharRNN (baseline) | JTVAE (ours) | Real drugs (target) |
-|--------|:---:|:---:|:---:|
-| Validity | 0.975 | **1.000** | — |
-| Uniqueness | 1.000 | 0.828 | — |
-| Novelty | 0.876 | **1.000** | — |
-| Internal diversity | 0.865 | 0.867 | — |
-| QED | 0.799 | **0.811** | ~0.80 |
-| LogP | 2.45 | 2.68 | ~2.45 |
-| SNN | **0.348** | 0.194 | — |
-| Scaffold similarity | **0.375** | 0.008 | — |
+### 7a. Generation quality (MOSES metrics)
 
-**Takeaway.** Both models generate valid, novel, drug-like molecules
-(QED ≈ 0.8, LogP within the Lipinski range). JTVAE reaches 100% validity and
-100% novelty thanks to structure-by-structure generation, while CharRNN stays
-closer to the training distribution (higher SNN / scaffold similarity). This is
-a genuine trade-off rather than one model dominating — consistent with the
-paper's thesis that graph-based generation guarantees validity, while our
-simplified assembly trades scaffold fidelity for broader exploration.
+| Metric | CharRNN | JTVAE — single-bond | JTVAE — enum_assemble |
+| ------ | ------- | ------------------- | --------------------- |
+| Validity | 0.9795 | **1.0000** | **1.0000** |
+| Uniqueness | 0.9996 | **1.0000** | **1.0000** |
+| Novelty | 0.8433 | **1.0000** | **1.0000** |
+| Internal diversity | 0.8664 | 0.8650 | **0.9016** |
+| FCD (↓) | **0.182** | 33.25 | 20.27 |
+| QED | **0.802** | 0.467 | 0.587 |
+| SNN | **0.346** | 0.168 | 0.200 |
+| Scaffold similarity | 0.391 | **0.484** | 0.034 |
+
+The assembler ablation (columns 2 vs 3, same checkpoint) shows enum_assemble reduces FCD by 39% and raises internal diversity, confirming that ring fusion improves distributional quality. The low scaffold similarity for enum_assemble reflects novel ring systems not present in ZINC — a side effect of random candidate selection without `z_G` scoring.
+
+### 7b. Property optimization (gradient ascent in latent space)
+
+Starting from 200 encoded test molecules, gradient ascent on a QED proxy MLP was run for 100 steps (lr=0.02). Results at the best step (step 60):
+
+- Mean ΔQED = **+0.076** (0.532 → 0.608)
+- Hit rate (ΔQED > 0.05) = **53%**
+- Best QED achieved = **0.943**
+- Validity maintained at ~100% throughout optimization
+
+This confirms the latent space is structured and meaningful (not collapsed): moving z in the direction of higher predicted QED reliably decodes into higher-QED molecules for the majority of starting points.
+
+**Overall takeaway.** JTVAE reaches 100% validity and novelty by construction. CharRNN better matches the ZINC distribution (lower FCD, higher QED). This is a genuine trade-off: graph-based generation guarantees structural validity while our unscored assembly explores broader scaffold space.
