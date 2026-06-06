@@ -2,7 +2,7 @@
 
 This document explains how our implementation relates to the original Junction
 Tree Variational Autoencoder (JTVAE) paper, and is honest about where we
-faithfully follow it and where we deliberately simplified it for a course-scale
+what we kept from it and where we simplified it for a course-scale
 project (training budget of a few hours on a single GPU).
 
 > **Reference paper**: Wengong Jin, Regina Barzilay, Tommi Jaakkola.
@@ -45,7 +45,7 @@ reconstruction.
 
 ---
 
-## 3. Where We Faithfully Follow the Paper
+## 3. What We Kept from the Paper
 
 - **Junction-tree decomposition** (`models/jtvae/chemutils.py`, `mol_tree.py`):
   same algorithm — extract rings + non-ring bonds as clusters, merge bridged
@@ -63,7 +63,7 @@ reconstruction.
 
 ---
 
-## 4. Where We Deliberately Simplified (and Why)
+## 4. Where We Simplified (and Why)
 
 | # | Paper | Ours | Reason |
 | - | ----- | ---- | ------ |
@@ -104,7 +104,7 @@ molecule — which explains two observations in our results:
 
 The original paper reports **reconstruction accuracy** (76.7%): encode a molecule
 `m` to `z`, decode it back, and measure how often the result is *exactly* `m`.
-We deliberately omit this metric, for a principled reason tied to simplification
+We omit this metric, for a principled reason tied to simplification
 4 (the graph decoder) above.
 
 Faithful reconstruction requires the decoder to use the graph latent `z_G` to
