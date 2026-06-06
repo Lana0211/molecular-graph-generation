@@ -1,0 +1,29 @@
+# --- Virtual environment ---
+venv/
+env/
+.venv/
+
+# --- Claude / editor config ---
+.claude/
+.vscode/
+.idea/
+
+# --- Python cache ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# --- Large auto-downloaded / derived datasets ---
+# These are recreated by data/download.py on first run.
+data/dataset_v1.csv
+data/train.csv
+data/test.csv
+
+# --- Redundant periodic JTVAE checkpoints ---
+# The final model (jtvae_best.pt) is kept; the per-5-epoch snapshots are not.
+results/jtvae/jtvae_epoch*.pt
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db

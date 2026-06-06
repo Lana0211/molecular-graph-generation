@@ -1,0 +1,34 @@
+# CE7076 Final Project — Python dependencies
+# Tested with Python 3.12 on Windows 11 + NVIDIA GPU (CUDA 12.1).
+#
+# PyTorch with CUDA is NOT installed from PyPI. Install it first with the
+# CUDA-enabled wheel, then install the rest of this file:
+#
+#   pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
+#   pip install -r requirements.txt
+#
+# For a CPU-only machine, drop the --index-url and install plain torch instead.
+
+# --- Deep learning (install via the CUDA index URL above) ---
+torch==2.5.1
+torchvision==0.20.1
+
+# --- Cheminformatics ---
+rdkit==2026.3.2
+fcd==1.2.2                # Fréchet ChemNet Distance metric
+
+# --- Scientific stack ---
+numpy==2.4.4
+pandas==3.0.3
+scipy==1.17.1
+scikit-learn==1.9.0
+networkx==3.6.1
+
+# --- Visualization ---
+matplotlib==3.10.9
+seaborn==0.13.2
+
+# --- Notebook / utilities ---
+notebook==7.5.7
+ipykernel==7.2.0
+tqdm==4.67.3

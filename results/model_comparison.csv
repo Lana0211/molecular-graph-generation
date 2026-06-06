@@ -1,0 +1,10 @@
+Metric,CharRNN,JTVAE,Better
+validity,0.9795,1.0000,↑ JTVAE
+uniqueness,0.9996,0.8279,
+novelty,0.8433,1.0000,↑ JTVAE
+internal_diversity,0.8664,0.8667,↑ JTVAE
+snn,0.3456,0.1944,
+fcd,0.1818,29.5681,
+qed_mean,0.8018,0.8108,↑ JTVAE
+sa_mean,1.2515,1.8491,↑ JTVAE
+logp_mean,2.4685,2.6759,↑ JTVAE
