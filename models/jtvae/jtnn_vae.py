@@ -21,6 +21,7 @@ Adapted from: wengong-jin/icml18-jtnn (MIT License)
 
 from __future__ import annotations
 
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -248,7 +249,7 @@ class JTVAE(nn.Module):
 
     @torch.no_grad()
     def generate(self, n: int = 1, max_nodes: int = 4,
-                 temperature: float = 1.0) -> List[str]:
+                 temperature: float = 1.2) -> List[str]:
         """Sample latent vectors from the prior N(0,1) and decode to SMILES."""
         device = next(self.parameters()).device
         self.eval()
@@ -336,12 +337,15 @@ class JTVAE(nn.Module):
         from rdkit import Chem
 
         def first_open_atom(mol, lo, hi):
-            """Index of an atom in [lo, hi) that has at least one implicit H."""
-            for idx in range(lo, hi):
-                atom = mol.GetAtomWithIdx(idx)
-                if atom.GetTotalNumHs() > 0:
-                    return idx
-            return None
+            """Random atom in [lo, hi) that has at least one implicit H.
+
+            Randomising the attachment point is critical for structural diversity:
+            always picking index 0 collapses all assemblies to the same topology
+            (spiro / heavily-fused rings), hurting uniqueness and FCD.
+            """
+            candidates = [idx for idx in range(lo, hi)
+                          if mol.GetAtomWithIdx(idx).GetTotalNumHs() > 0]
+            return random.choice(candidates) if candidates else None
 
         combined = Chem.CombineMols(mol_a, mol_b)   # disconnected union
         rw       = Chem.RWMol(combined)
@@ -365,13 +369,22 @@ class JTVAE(nn.Module):
     # ------------------------------------------------------------------
 
     def forward(self, mol_batch: List[MolTree],
-                beta: float = 1.0) -> Tuple[torch.Tensor, dict]:
-        """Compute the β-VAE objective: ELBO = rec_loss + β · KL."""
+                beta: float = 1.0,
+                free_bits: float = 0.0) -> Tuple[torch.Tensor, dict]:
+        """Compute the β-VAE objective: ELBO = rec_loss + β · KL.
+
+        free_bits: minimum KL nats per latent dimension (Kingma et al. 2016).
+        Setting free_bits > 0 prevents posterior collapse by refusing to reward
+        the encoder for collapsing dimensions below this floor.
+        """
         z_mean, z_log_var, _ = self.encode(mol_batch)
         z = self.reparametrize(z_mean, z_log_var)
 
         # KL divergence: D_KL(q(z|x) ‖ p(z)) with p(z) = N(0,I)
-        kl      = -0.5 * (1 + z_log_var - z_mean.pow(2) - z_log_var.exp())
+        kl = -0.5 * (1 + z_log_var - z_mean.pow(2) - z_log_var.exp())
+        if free_bits > 0.0:
+            # Clamp per-dimension KL: don't reward collapsing below free_bits nats
+            kl = torch.clamp(kl, min=free_bits)
         kl_loss = kl.sum(dim=1).mean()   # sum over latent dims, mean over batch
 
         rec_loss = self.decode_train(z, mol_batch)   # sequence cross-entropy

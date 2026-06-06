@@ -187,7 +187,7 @@ def anneal_beta(epoch: int, max_epoch: int,
 
 
 def train_one_epoch(model: JTVAE, loader, optimizer, device: torch.device,
-                    beta: float) -> dict:
+                    beta: float, free_bits: float = 0.0) -> dict:
     """Run one training epoch; return average loss statistics."""
     model.train()
     total     = {"loss": 0.0, "rec_loss": 0.0, "kl_loss": 0.0}
@@ -195,7 +195,7 @@ def train_one_epoch(model: JTVAE, loader, optimizer, device: torch.device,
     for batch in loader:
         optimizer.zero_grad()
         try:
-            loss, stats = model(batch, beta=beta)
+            loss, stats = model(batch, beta=beta, free_bits=free_bits)
             if torch.isnan(loss) or torch.isinf(loss):
                 continue   # skip numerically unstable batches
             loss.backward()
