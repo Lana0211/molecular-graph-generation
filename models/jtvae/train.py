@@ -115,9 +115,10 @@ class JTVAEDataset(Dataset):
               f"out-of-vocab: {skip_counts['oov']:,}")
 
         # Pre-compute and cache graph features for every molecule.
-        # This moves atom feature computation out of the training loop so
-        # each batch only does GPU tensor slicing instead of Python iteration
-        # over atoms — reduces per-epoch time from ~10 min to ~1-2 min.
+        # Atom-feature extraction is pure-Python and slow; doing it once here
+        # (rather than every epoch inside the training loop) means each batch
+        # only slices ready-made tensors. This cut per-epoch time from ~10 min
+        # to ~1-2 min. The result is stashed on each tree as `_graph_cache`.
         print("[JTVAEDataset] Pre-computing graph features ...")
         from models.jtvae.mpn import atom_features, ATOM_FDIM, MAX_NB
         cached, failed = 0, 0
@@ -128,25 +129,29 @@ class JTVAEDataset(Dataset):
                 failed += 1
                 continue
             try:
+                # Row 0 is the shared padding atom; real atoms start at index 1.
                 fatoms_list = [torch.zeros(ATOM_FDIM)]
                 nbr_lists   = [[]]
-                idx_map     = {}
+                idx_map     = {}     # RDKit atom idx → local cache index
                 n_at        = 1
+                # One feature vector per atom, recording its local index.
                 for atom in mol.GetAtoms():
                     fatoms_list.append(atom_features(atom))
                     idx_map[atom.GetIdx()] = n_at
                     nbr_lists.append([])
                     n_at += 1
+                # Each bond adds the two atoms to each other's neighbour list.
                 for bond in mol.GetBonds():
                     g1 = idx_map[bond.GetBeginAtomIdx()]
                     g2 = idx_map[bond.GetEndAtomIdx()]
                     nbr_lists[g1].append(g2)
                     nbr_lists[g2].append(g1)
+                # Pack the ragged neighbour lists into a fixed (n_at, MAX_NB) tensor.
                 anbr = torch.zeros(n_at, MAX_NB, dtype=torch.long)
                 for i, nbrs in enumerate(nbr_lists):
                     for k, j in enumerate(nbrs[:MAX_NB]):
                         anbr[i, k] = j
-                # Store as CPU tensors; moved to GPU in _build_graph_batch
+                # Keep tensors on CPU; _build_graph_batch moves them to GPU later.
                 tree._graph_cache = (
                     torch.stack(fatoms_list, dim=0),   # (n_at, ATOM_FDIM)
                     anbr,                               # (n_at, MAX_NB)
@@ -154,7 +159,7 @@ class JTVAEDataset(Dataset):
                 )
                 cached += 1
             except Exception:
-                tree._graph_cache = None
+                tree._graph_cache = None   # mark for the slow fallback path
                 failed += 1
         print(f"[JTVAEDataset] Graph cache: {cached:,} ok, {failed:,} failed")
 
@@ -176,30 +181,41 @@ def jtvae_collate(batch):
 
 def anneal_beta(epoch: int, max_epoch: int,
                 beta_max: float = 1.0, warmup: int = 5) -> float:
-    """Return the KL weight for the current epoch using linear annealing.
+    """Return the KL weight β for the current epoch using linear annealing.
 
-    Keeping beta=0 during warmup lets the model focus on reconstruction first,
-    which prevents posterior collapse.
+    The full VAE loss is rec_loss + β·KL. Turning on the KL term immediately
+    tends to collapse the latent, so we ramp β up gradually:
+      - epochs < warmup: β = 0, pure reconstruction (learn to use the latent).
+      - after warmup:    β rises linearly from 0 to beta_max by the last epoch.
     """
     if epoch < warmup:
-        return 0.0   # pure reconstruction phase
+        return 0.0   # pure reconstruction phase, no KL pressure yet
+    # Linearly interpolate from 0 (at warmup) up to beta_max (at max_epoch).
     return min(beta_max, beta_max * (epoch - warmup) / max(1, max_epoch - warmup))
 
 
 def train_one_epoch(model: JTVAE, loader, optimizer, device: torch.device,
                     beta: float, free_bits: float = 0.0) -> dict:
-    """Run one training epoch; return average loss statistics."""
+    """Run one training epoch; return average loss statistics.
+
+    Standard VAE training loop, with two robustness guards: batches that produce
+    NaN/Inf losses are skipped, and per-batch RuntimeErrors (e.g. a degenerate
+    graph) are caught so one bad molecule can't kill the whole epoch.
+    """
     model.train()
+    # Running sums of each loss component; divided by n_batches at the end.
     total     = {"loss": 0.0, "rec_loss": 0.0, "kl_loss": 0.0}
     n_batches = 0
     for batch in loader:
         optimizer.zero_grad()
         try:
+            # forward() returns the scalar loss plus a dict of its components.
             loss, stats = model(batch, beta=beta, free_bits=free_bits)
             if torch.isnan(loss) or torch.isinf(loss):
                 continue   # skip numerically unstable batches
             loss.backward()
-            # Large max_norm because junction-tree gradients can be spikey
+            # Clip gradients; the norm is large because junction-tree gradients
+            # are naturally spikier than a plain RNN's.
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=50.0)
             optimizer.step()
             for k in total:

@@ -36,7 +36,13 @@ from models.jtvae.chemutils import get_mol, enum_assemble
 
 class _AssemblyNode:
     """Minimal node exposing the ``.mol`` / ``.nid`` attributes that the
-    junction-tree graph decoder (chemutils.enum_assemble) expects."""
+    junction-tree graph decoder (chemutils.enum_assemble) expects.
+
+    enum_assemble was written for MolTreeNode objects, but at generation time we
+    only have bare RDKit mols. This tiny wrapper gives them the two attributes
+    enum_assemble reads, without dragging in the whole MolTreeNode machinery.
+    __slots__ keeps it lightweight (no per-instance __dict__).
+    """
 
     __slots__ = ("mol", "nid")
 
@@ -44,10 +50,6 @@ class _AssemblyNode:
         self.mol = mol
         self.nid = nid
 
-
-# ---------------------------------------------------------------------------
-# Tree encoder: vectorized GCN-style message passing over the junction tree
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Tree encoder: vectorized GCN-style message passing over the junction tree
@@ -73,32 +75,42 @@ class JTNNEncoder(nn.Module):
         self.W_msg      = nn.Linear(hidden_dim, hidden_dim)   # neighbour update
 
     def encode(self, tree_batch: List[MolTree]) -> Tuple[None, torch.Tensor]:
-        """Return (None, root_vecs) where root_vecs is (batch, hidden_dim)."""
+        """Return (None, root_vecs) where root_vecs is (batch, hidden_dim).
+
+        Like the graph MPN, but the "graph" here is the junction tree and the
+        node features come from the cluster-vocabulary embedding table.
+        """
         device = next(self.parameters()).device
 
-        # --- Build batched node indices + tree adjacency on CPU ---
-        wids      = [0]    # index 0 = padding node
-        nbr_lists = [[]]
+        # --- Flatten every tree in the batch into one big node list on CPU ---
+        # Same batching trick as mpn.mol2graph: concatenate all nodes, remember
+        # each tree's root, and use a shared padding node at global index 0.
+        wids      = [0]    # node 0 = padding; its embedding is masked to zero
+        nbr_lists = [[]]   # nbr_lists[g] = global indices of node g's neighbours
         roots     = []     # global index of each tree's root node (0 if empty)
         n_nodes   = 1
 
         for tree in tree_batch:
             if not tree.nodes:
-                roots.append(0)
+                roots.append(0)          # empty tree → point at the padding node
                 continue
+            # First pass: assign a global index to every node and record its wid.
             local_to_global = {}
             for node in tree.nodes:
                 wids.append(node.wid)
                 local_to_global[node.nid] = n_nodes
                 nbr_lists.append([])
                 n_nodes += 1
+            # Second pass: translate each node's neighbour list to global indices.
             for node in tree.nodes:
                 gi = local_to_global[node.nid]
                 for nb in node.neighbors:
                     nbr_lists[gi].append(local_to_global[nb.nid])
+            # The tree's first node is treated as its root (summary node).
             roots.append(local_to_global[tree.nodes[0].nid])
 
-        # Dynamic neighbour width (tree nodes can have many substituents)
+        # Pad every neighbour list to a common width so it fits a rectangular
+        # tensor. Tree nodes vary a lot in degree, so size to the actual max.
         max_nb = max((len(x) for x in nbr_lists), default=1) or 1
         anbr_cpu = torch.zeros(n_nodes, max_nb, dtype=torch.long)
         for i, nbrs in enumerate(nbr_lists):
@@ -108,18 +120,18 @@ class JTNNEncoder(nn.Module):
         wids_t = torch.tensor(wids, dtype=torch.long, device=device)
         anbr   = anbr_cpu.to(device)
 
-        # --- Vectorized synchronous message passing ---
+        # --- Vectorized synchronous message passing (one pass for all trees) ---
         mask    = torch.ones(n_nodes, 1, device=device)
         mask[0] = 0.0                                  # padding node contributes nothing
-        h0 = self.embedding(wids_t) * mask             # (n_nodes, H)
+        h0 = self.embedding(wids_t) * mask             # (n_nodes, H) initial states
         h  = h0
         for _ in range(self.depth):
-            nei = index_select_ND(h, 0, anbr).sum(dim=1)   # aggregate neighbours
-            h   = torch.relu(h0 + self.W_msg(nei)) * mask
+            nei = index_select_ND(h, 0, anbr).sum(dim=1)   # sum each node's neighbours
+            h   = torch.relu(h0 + self.W_msg(nei)) * mask  # update with residual to h0
 
-        # --- Gather one root vector per tree ---
+        # --- Read out one vector per tree by gathering its root node's state ---
         root_idx  = torch.tensor(roots, dtype=torch.long, device=device)
-        root_vecs = h.index_select(0, root_idx)        # (batch, H); row 0 = zeros
+        root_vecs = h.index_select(0, root_idx)        # (batch, H); empty trees → row 0 zeros
         return None, root_vecs
 
 
@@ -145,23 +157,29 @@ class JTVAE(nn.Module):
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
 
-        # Shared embedding table for junction-tree cluster vocabulary
+        # One embedding table shared by both the tree encoder and the decoder,
+        # mapping each cluster-vocabulary id to a hidden_dim vector.
         self.embedding = nn.Embedding(len(vocab), hidden_dim)
 
+        # The two encoder branches: one over the junction tree, one over the
+        # atom graph. Their outputs are fused into the latent below.
         self.tree_enc = JTNNEncoder(hidden_dim, depth_t, self.embedding)  # tree encoder
         self.mpn      = MPN(hidden_dim, depth_g)                          # graph encoder
 
-        # Separate μ / log σ² projections for tree and graph branches
+        # Each branch gets its own linear maps to the VAE's mean and log-variance.
+        # (T_* = tree branch, G_* = graph branch.)
         self.T_mean = nn.Linear(hidden_dim, latent_dim)
         self.T_var  = nn.Linear(hidden_dim, latent_dim)
         self.G_mean = nn.Linear(hidden_dim, latent_dim)
         self.G_var  = nn.Linear(hidden_dim, latent_dim)
 
-        # Decoder GRU: at each step, takes (node_embedding ‖ z) and predicts next node
+        # Decoder GRU: each step consumes [current cluster embedding ‖ latent z]
+        # and predicts the next cluster. Conditioning on z at every step keeps
+        # the generation tied to the sampled latent.
         self.dec_rnn = nn.GRU(hidden_dim + latent_dim, hidden_dim, batch_first=True)
-        self.dec_out = nn.Linear(hidden_dim, len(vocab))   # output vocab logits
+        self.dec_out = nn.Linear(hidden_dim, len(vocab))   # hidden state → vocab logits
 
-        # Project latent vector to initial GRU hidden state
+        # Turns the latent z into the GRU's initial hidden state.
         self.z_to_h  = nn.Linear(latent_dim, hidden_dim)
 
     # ------------------------------------------------------------------
@@ -169,27 +187,35 @@ class JTVAE(nn.Module):
     # ------------------------------------------------------------------
 
     def encode(self, mol_batch: List[MolTree]):
-        """Encode a batch of molecules into (μ, log σ², tree_vecs)."""
+        """Encode a batch of molecules into (μ, log σ², tree_vecs).
+
+        Runs both encoder branches and fuses them into a single Gaussian
+        latent distribution N(μ, σ²) per molecule.
+        """
         device = next(self.parameters()).device
 
-        _, tree_vecs = self.tree_enc.encode(mol_batch)   # tree branch
+        _, tree_vecs = self.tree_enc.encode(mol_batch)   # tree branch summary vectors
 
-        # Graph branch: pass trees (not raw mols) so _build_graph_batch
-        # can use pre-computed graph caches when available
+        # Graph branch: pass MolTree objects (not raw mols) so _build_graph_batch
+        # can reuse the per-molecule feature caches built during dataset init.
         trees_with_mol = [t for t in mol_batch if t.mol is not None]
         if trees_with_mol:
             graph_batch = self._build_graph_batch(trees_with_mol, device)
             graph_vecs  = self.mpn(graph_batch)
         else:
+            # No parseable molecules in this batch → fall back to zeros.
             graph_vecs = torch.zeros(len(mol_batch), self.hidden_dim, device=device)
 
-        # Negative abs ensures log_var ≤ 0, i.e. std ≤ 1 (stabilises training)
+        # Project each branch to a mean and a log-variance. Using -|·| forces
+        # log_var ≤ 0 (so σ ≤ 1), which keeps the sampling noise bounded and
+        # training numerically stable.
         tree_mean    = self.T_mean(tree_vecs)
         tree_log_var = -torch.abs(self.T_var(tree_vecs))
         graph_mean   = self.G_mean(graph_vecs)
         graph_log_var= -torch.abs(self.G_var(graph_vecs))
 
-        # Average the two branches to get the final latent distribution
+        # Fuse the two branches by averaging (our simplification of the paper's
+        # concatenation) to get one latent distribution per molecule.
         z_mean    = (tree_mean    + graph_mean)    / 2
         z_log_var = (tree_log_var + graph_log_var) / 2
 
@@ -197,12 +223,16 @@ class JTVAE(nn.Module):
 
     def reparametrize(self, mean: torch.Tensor,
                       log_var: torch.Tensor) -> torch.Tensor:
-        """Reparameterisation trick: z = μ + ε·σ  (ε ~ N(0,1))."""
+        """Reparameterisation trick: z = μ + ε·σ  (ε ~ N(0,1)).
+
+        Sampling z directly is not differentiable; rewriting it as μ + ε·σ moves
+        the randomness into ε so gradients can still flow back into μ and σ.
+        """
         if self.training:
-            std = torch.exp(0.5 * log_var)
-            eps = torch.randn_like(std)   # sample noise
+            std = torch.exp(0.5 * log_var)   # σ = exp(½ log σ²)
+            eps = torch.randn_like(std)      # draw standard-normal noise
             return mean + eps * std
-        return mean   # at inference, just use the mean
+        return mean   # at inference we use the distribution mean (no noise)
 
     # ------------------------------------------------------------------
     # Decoding (teacher-forced, training only)
@@ -218,7 +248,8 @@ class JTVAE(nn.Module):
         """
         device = z.device
 
-        # Collect per-tree node-id sequences; skip empty trees
+        # Each tree becomes a sequence of cluster ids; empty trees are dropped.
+        # z_idx records which latent row belongs to each kept sequence.
         seqs    = [[n.wid for n in t.nodes] for t in mol_batch if t.nodes]
         z_idx   = [b for b, t in enumerate(mol_batch) if t.nodes]
         if not seqs:
@@ -227,30 +258,34 @@ class JTVAE(nn.Module):
         B       = len(seqs)
         max_len = max(len(s) for s in seqs)
 
-        # Pad token ids to (B, max_len); pad value 0 (masked later)
+        # Pad all sequences to (B, max_len). Pad value 0 is harmless because the
+        # corresponding label positions are masked out of the loss below.
         tok = torch.zeros(B, max_len, dtype=torch.long, device=device)
         for i, s in enumerate(seqs):
             tok[i, :len(s)] = torch.tensor(s, device=device)
 
         embs = self.embedding(tok)                         # (B, max_len, H)
 
-        # Broadcast each tree's latent z across its time steps
+        # Tile each tree's latent z across all of its time steps and concatenate
+        # it onto every input embedding, so the decoder sees z at each step.
         z_sel  = z[torch.tensor(z_idx, device=device)]     # (B, L)
         z_step = z_sel.unsqueeze(1).expand(B, max_len, self.latent_dim)
         embs_z = torch.cat([embs, z_step], dim=-1)         # (B, max_len, H+L)
 
-        # Single batched GRU call; initial hidden from latent
+        # Run the whole batch through the GRU in one call (initial hidden = f(z)).
         h0 = self.z_to_h(z_sel).unsqueeze(0)               # (1, B, H)
         out, _ = self.dec_rnn(embs_z, h0)                  # (B, max_len, H)
-        logits = self.dec_out(out)                         # (B, max_len, V)
+        logits = self.dec_out(out)                         # (B, max_len, V) next-cluster scores
 
-        # Labels = next node; last step has no target → ignore.
-        # Padded positions are also set to ignore_index (-100).
+        # Teacher forcing: the target at step t is the cluster at step t+1.
+        # The final step has no "next" node, and padded steps have no target,
+        # so both are filled with -100 and ignored by cross_entropy.
         labels = torch.full((B, max_len), -100, dtype=torch.long, device=device)
         for i, s in enumerate(seqs):
             if len(s) > 1:
                 labels[i, :len(s) - 1] = torch.tensor(s[1:], device=device)
 
+        # Flatten (B, max_len, V) → (B*max_len, V) for the classification loss.
         return F.cross_entropy(
             logits.reshape(-1, logits.size(-1)),
             labels.reshape(-1),
@@ -284,26 +319,29 @@ class JTVAE(nn.Module):
         device     = z.device
         results    = []
 
+        # Decode one molecule at a time (generation is inherently sequential).
         for b in range(z.size(0)):
-            h_rnn  = self.z_to_h(z[b:b+1]).unsqueeze(0)   # (1, 1, H)
+            h_rnn  = self.z_to_h(z[b:b+1]).unsqueeze(0)   # initial hidden = f(z)
             wids   = []
-            cur_wid = 0   # seed with vocab[0] (simplest cluster)
+            cur_wid = 0   # seed the sequence with vocab[0] (the simplest cluster)
 
             for _ in range(max_nodes):
+                # Feed the current cluster + z into the GRU to score the next one.
                 cur_t  = torch.tensor([cur_wid], device=device)
                 emb    = self.embedding(cur_t)                         # (1, H)
                 emb_z  = torch.cat([emb, z[b:b+1]], dim=-1).unsqueeze(0)  # (1,1,H+L)
                 out, h_rnn = self.dec_rnn(emb_z, h_rnn)
-                logits = self.dec_out(out.squeeze(0)) / temperature    # apply temperature
+                logits = self.dec_out(out.squeeze(0)) / temperature    # temperature scaling
                 probs  = F.softmax(logits, dim=-1)
-                next_wid = torch.multinomial(probs, 1).item()   # stochastic sampling
+                next_wid = torch.multinomial(probs, 1).item()   # sample the next cluster
 
-                # Stop if the decoder cycles back to the seed token
+                # wid 0 acts as the stop token once at least one cluster exists.
                 if next_wid == 0 and wids:
                     break
                 wids.append(int(next_wid))
                 cur_wid = int(next_wid)
 
+            # Turn the decoded cluster sequence into an actual SMILES molecule.
             results.append(self._wids_to_smiles(wids, assembler=assembler))
 
         return results

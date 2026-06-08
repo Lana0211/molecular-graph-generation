@@ -1,10 +1,16 @@
 """
 Chemistry utilities for junction tree VAE.
 
-Provides helper functions for:
-- Kekulized SMILES handling (explicit single/double bonds instead of aromatic)
-- Ring system detection and bridged-ring merging
-- Subgraph extraction and molecule copying
+Two responsibilities live here:
+  1. Decomposition (encode side): break a molecule into clusters / a junction
+     tree — ring detection, bridged-ring merging, subgraph extraction.
+  2. Assembly (decode side): the enum_assemble family glues decoded clusters
+     back into a full molecule, enumerating every valid way two clusters can
+     share an atom or fuse along a bond.
+
+Throughout, molecules are kept *kekulized* (aromatic rings written as explicit
+alternating single/double bonds) because the assembly logic compares concrete
+bond patterns.
 
 Adapted from: wengong-jin/icml18-jtnn (MIT License)
 """
@@ -90,18 +96,20 @@ def tree_decomp(mol: Chem.Mol) -> Tuple[List[List[int]], List[Tuple[int, int]]]:
 
     cliques: List[List[int]] = []
 
-    # Add two-atom cliques for every acyclic bond
+    # Step 1: every bond NOT in a ring is its own 2-atom cluster (a chain bond).
     for bond in mol.GetBonds():
         a1, a2 = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
         if not bond.IsInRing():
             cliques.append([a1, a2])
 
-    # Add one clique per ring in the Smallest Set of Smallest Rings (SSSR)
+    # Step 2: every ring (from RDKit's Smallest Set of Smallest Rings) is a cluster.
     ring_info = mol.GetRingInfo()
     for ring in ring_info.AtomRings():
         cliques.append(list(ring))
 
-    # Merge rings that share more than 2 atoms (bridged / spiro systems)
+    # Step 3: merge rings sharing >2 atoms. Two rings fused over a single bond
+    # share 2 atoms and stay separate (a normal fused ring); sharing 3+ atoms
+    # means a bridged/spiro system that must be treated as ONE rigid cluster.
     for i in range(len(cliques)):
         if len(cliques[i]) <= 2:
             continue
@@ -110,13 +118,14 @@ def tree_decomp(mol: Chem.Mol) -> Tuple[List[List[int]], List[Tuple[int, int]]]:
                 continue
             shared = set(cliques[i]) & set(cliques[j])
             if len(shared) > 2:
-                # Absorb clique j into clique i; mark j as empty to remove later
+                # Absorb clique j into clique i; blank j out, drop it below.
                 cliques[i] += [x for x in cliques[j] if x not in cliques[i]]
                 cliques[j]  = []
 
-    cliques = [c for c in cliques if c]   # remove empty cliques from merging
+    cliques = [c for c in cliques if c]   # drop the emptied-out merged cliques
 
-    # Build the clique adjacency graph: two cliques are adjacent if they share atoms
+    # Step 4: connect two clusters with an edge whenever they share any atom —
+    # that shared atom is the junction between them.
     edges: List[Tuple[int, int]] = []
     for i in range(len(cliques)):
         for j in range(i + 1, len(cliques)):
@@ -232,13 +241,15 @@ def enum_attach(ctr_mol: Chem.Mol, nei_node, amap: list, singletons: list) -> li
     (atom-share *and* bond-share / fusion).
     """
     nei_mol, nei_idx = nei_node.mol, nei_node.nid
-    att_confs = []
+    att_confs = []   # collected attachment configurations to return
 
-    # Atoms already claimed by a singleton neighbour cannot be reused
+    # Atoms already claimed by a singleton neighbour are off-limits for reuse.
     black_list = [atom_idx for nei_id, atom_idx, _ in amap if nei_id in singletons]
     ctr_atoms  = [a for a in ctr_mol.GetAtoms() if a.GetIdx() not in black_list]
     ctr_bonds  = list(ctr_mol.GetBonds())
 
+    # --- Case 1: neighbour is a lone atom (no bonds) -----------------------
+    # It can attach to any center atom of the same element that is still free.
     if nei_mol.GetNumBonds() == 0:                      # neighbour is a singleton atom
         nei_atom  = nei_mol.GetAtomWithIdx(0)
         used_list = [atom_idx for _, atom_idx, _ in amap]
@@ -246,12 +257,15 @@ def enum_attach(ctr_mol: Chem.Mol, nei_node, amap: list, singletons: list) -> li
             if atom_equal(atom, nei_atom) and atom.GetIdx() not in used_list:
                 att_confs.append(amap + [(nei_idx, atom.GetIdx(), 0)])
 
+    # --- Case 2: neighbour is a single bond (two atoms) --------------------
+    # Either end atom can be the shared atom, provided the center atom has
+    # enough free valence (spare hydrogens) to accept the bond.
     elif nei_mol.GetNumBonds() == 1:                    # neighbour is a single bond
         bond     = nei_mol.GetBondWithIdx(0)
-        bond_val = int(bond.GetBondTypeAsDouble())
+        bond_val = int(bond.GetBondTypeAsDouble())      # 1=single, 2=double, ...
         b1, b2   = bond.GetBeginAtom(), bond.GetEndAtom()
         for atom in ctr_atoms:
-            # A carbon without enough free valence cannot take the bond
+            # A carbon without enough spare hydrogens can't form this bond.
             if atom.GetAtomicNum() == 6 and atom.GetTotalNumHs() < bond_val:
                 continue
             if atom_equal(atom, b1):
@@ -259,8 +273,10 @@ def enum_attach(ctr_mol: Chem.Mol, nei_node, amap: list, singletons: list) -> li
             elif atom_equal(atom, b2):
                 att_confs.append(amap + [(nei_idx, atom.GetIdx(), b2.GetIdx())])
 
+    # --- Case 3: neighbour is a ring --------------------------------------
+    # Two sub-cases produce the two ways rings can join.
     else:                                               # neighbour is a ring
-        # (a) share a single atom
+        # (a) Spiro / single-atom share: the two rings meet at one shared atom.
         for a1 in ctr_atoms:
             for a2 in nei_mol.GetAtoms():
                 if atom_equal(a1, a2):
@@ -268,7 +284,9 @@ def enum_attach(ctr_mol: Chem.Mol, nei_node, amap: list, singletons: list) -> li
                        a1.GetTotalNumHs() + a2.GetTotalNumHs() < 4:
                         continue
                     att_confs.append(amap + [(nei_idx, a1.GetIdx(), a2.GetIdx())])
-        # (b) fuse along a shared bond (in both orientations)
+        # (b) Ring fusion: the two rings share a whole bond (two atoms). This is
+        # what builds fused systems like indole / quinoline. Both orientations of
+        # the shared edge are tried, since the bond can line up either way.
         if ctr_mol.GetNumBonds() > 1:
             for b1 in ctr_bonds:
                 for b2 in nei_mol.GetBonds():
@@ -283,8 +301,9 @@ def enum_attach(ctr_mol: Chem.Mol, nei_node, amap: list, singletons: list) -> li
                             (nei_idx, b1.GetEndAtom().GetIdx(),   b2.GetBeginAtom().GetIdx()),
                         ])
 
+        # A highly symmetric ring can explode the candidate count; cap it.
         if len(att_confs) > MAX_NCAND:
-            att_confs = att_confs[:MAX_NCAND]       # cap pathological ring blow-ups
+            att_confs = att_confs[:MAX_NCAND]
     return att_confs
 
 
@@ -336,20 +355,27 @@ def enum_assemble(node, neighbors: list, prev_nodes: list = None,
     """
     prev_nodes = prev_nodes or []
     prev_amap  = prev_amap or []
-    all_attach_confs = []
+    all_attach_confs = []   # complete amaps covering every neighbour
+    # Single-atom neighbours get special "claimed atom" handling in enum_attach.
     singletons = [nei.nid for nei in neighbors + prev_nodes
                   if nei.mol.GetNumAtoms() == 1]
 
     def search(cur_amap, depth):
+        # Depth-first search that attaches neighbours one at a time. `cur_amap`
+        # is the partial attachment built so far; `depth` is which neighbour
+        # we're placing next.
         if len(all_attach_confs) > MAX_NCAND:
-            return
+            return                                   # global safety cap
         if depth == len(neighbors):
-            all_attach_confs.append(cur_amap)
+            all_attach_confs.append(cur_amap)        # all neighbours placed
             return
         nei_node  = neighbors[depth]
+        # Enumerate every way to attach this one neighbour given what's placed.
         cand_amap = enum_attach(node.mol, nei_node, cur_amap, singletons)
         seen      = set()
         viable    = []
+        # Keep only attachments that sanitise to a valid molecule, de-duplicated
+        # by canonical SMILES, so the recursion doesn't explore equivalent paths.
         for amap in cand_amap:
             cand = local_attach(node.mol, neighbors[:depth + 1], prev_nodes, amap)
             cand = sanitize(cand)
@@ -360,15 +386,19 @@ def enum_assemble(node, neighbors: list, prev_nodes: list = None,
                 continue
             seen.add(smi)
             viable.append(amap)
+        # Recurse into each surviving partial attachment.
         for new_amap in viable:
             search(new_amap, depth + 1)
 
     search(prev_amap, 0)
 
+    # Materialise every complete attachment into a final (smiles, mol, amap)
+    # triple, de-duplicating once more on the fully assembled molecule.
     candidates, seen = [], set()
     for amap in all_attach_confs:
         cand = local_attach(node.mol, neighbors, prev_nodes, amap)
         try:
+            # Round-trip through SMILES to canonicalise and validate.
             cand = Chem.MolFromSmiles(Chem.MolToSmiles(cand))
             if cand is None:
                 continue
@@ -378,6 +408,6 @@ def enum_assemble(node, neighbors: list, prev_nodes: list = None,
             seen.add(smi)
             Chem.Kekulize(cand)
         except Exception:
-            continue
+            continue   # drop anything RDKit rejects
         candidates.append((smi, cand, amap))
     return candidates

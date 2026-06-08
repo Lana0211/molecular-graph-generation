@@ -1,9 +1,14 @@
 """
 Junction Tree (JT) construction for molecular graphs.
 
-Each molecule is decomposed into a tree of clusters (ring systems and
-single bonds).  The tree is rooted at an arbitrary node and serialised
-for use as input to the JTVAE encoder.
+Core idea of JTVAE: instead of generating a molecule atom-by-atom (error-prone),
+collapse it into a *tree of chemical building blocks*. Each cluster node is a
+ring system or a single bond; edges connect clusters that share atoms. Because
+the building blocks are valid by construction, generating the tree first and
+then gluing the blocks together yields chemically valid molecules.
+
+This file turns a SMILES string into that tree (MolTree) and maintains the
+cluster vocabulary (Vocab) the model decodes into.
 
 Adapted from: wengong-jin/icml18-jtnn (MIT License)
 """
@@ -42,22 +47,33 @@ class MolTreeNode:
         self.is_leaf = False   # a node with any neighbor is not a leaf
 
     def recover(self, original_mol: Chem.Mol) -> str:
-        """Recover the SMILES label of this node in the context of the full molecule."""
+        """Recover the SMILES label of this node *in context* of the full molecule.
+
+        A cluster on its own is ambiguous — e.g. a benzene ring looks the same
+        regardless of what hangs off it. To learn how clusters attach, the label
+        is the sub-molecule covering this cluster plus all neighbouring clusters'
+        atoms, so the attachment points are visible.
+        """
         clique = list(self.clique)
         if not self.is_leaf:
-            # Include atoms from neighboring nodes to capture attachment context
+            # Pull in neighbouring clusters' atoms to capture attachment context.
             for nb in self.neighbors:
                 clique.extend(nb.clique)
-        clique    = list(set(clique))
-        label_mol = get_clique_mol(original_mol, clique)
+        clique    = list(set(clique))          # dedupe shared atoms
+        label_mol = get_clique_mol(original_mol, clique)   # carve out that sub-mol
         return get_smiles(label_mol)
 
     def assemble(self) -> None:
-        """Reorder neighbors so larger clusters come first (helps tree decoding)."""
-        # Non-singleton neighbors sorted by size (largest first)
+        """Reorder neighbors so larger clusters come first (helps tree decoding).
+
+        Decoding attaches neighbours one at a time; placing the big ring systems
+        before single-atom substituents gives a stable, deterministic order that
+        the decoder can rely on.
+        """
+        # Multi-atom neighbours (rings / bonds), largest first.
         multi    = sorted([nb for nb in self.neighbors if nb.mol.GetNumAtoms() > 1],
                           key=lambda x: x.mol.GetNumAtoms(), reverse=True)
-        # Single-atom clusters (substituents) appended at the end
+        # Single-atom clusters (e.g. substituent atoms) go last.
         singles  = [nb for nb in self.neighbors if nb.mol.GetNumAtoms() == 1]
         self.neighbors = multi + singles
 
@@ -77,40 +93,49 @@ class MolTree:
             return
 
         try:
-            Chem.Kekulize(self.mol)   # convert aromatic bonds to alternating single/double
+            # Kekulization rewrites aromatic rings as explicit alternating
+            # single/double bonds. The decomposition logic needs this concrete
+            # bond pattern; some exotic aromatic systems can't be kekulized.
+            Chem.Kekulize(self.mol)
             self.nodes = self._build_tree()
         except Exception:
-            # Skip molecules whose aromatic system RDKit cannot kekulize
+            # Skip molecules whose aromatic system RDKit cannot kekulize.
             self.nodes = []
 
     def _build_tree(self) -> List[MolTreeNode]:
-        cliques, edges = tree_decomp(self.mol)   # decompose into cliques and adjacency
+        # Step 1: decompose the molecule into clusters (cliques) plus the edges
+        # describing which clusters share atoms. tree_decomp lives in chemutils.
+        cliques, edges = tree_decomp(self.mol)
 
-        # Create one MolTreeNode per clique
+        # Step 2: create one MolTreeNode per clique, labelled by its SMILES.
         nodes = []
         for c in cliques:
             if len(c) == 1:
-                # Single-atom clique: generate SMILES rooted at that atom
+                # Single-atom clique: canonicalise the SMILES rooted at that atom
+                # so identical single atoms always get the same label.
                 smi = Chem.MolToSmiles(
                     Chem.MolFromSmiles(
                         Chem.MolToSmiles(Chem.RWMol(self.mol), rootedAtAtom=c[0])
                     )
                 )
             else:
+                # Multi-atom clique: extract the sub-molecule and read its SMILES.
                 cmol = get_clique_mol(self.mol, c)
                 smi  = get_smiles(cmol)
             nodes.append(MolTreeNode(smi, c))
 
-        # Wire bidirectional neighbor links from the clique adjacency list
+        # Step 3: turn the edge list into bidirectional neighbour links so the
+        # tree can be traversed from any node.
         for i, j in edges:
             nodes[i].add_neighbor(nodes[j])
             nodes[j].add_neighbor(nodes[i])
 
-        # Assign sequential node IDs (1-indexed; 0 is reserved as 'no node')
+        # Step 4: assign 1-indexed node IDs (id 0 is reserved to mean "no node",
+        # used as a padding / stop marker elsewhere).
         for idx, node in enumerate(nodes):
             node.nid = idx + 1
 
-        # Sort each node's neighbor list for deterministic decoding order
+        # Step 5: canonicalise each neighbour ordering for deterministic decoding.
         for node in nodes:
             node.assemble()
 
@@ -163,9 +188,14 @@ class Vocab:
 
 
 def build_vocab(smiles_list: List[str]) -> Vocab:
-    """Collect all unique cluster SMILES from a training corpus and build a Vocab."""
+    """Collect all unique cluster SMILES from a training corpus and build a Vocab.
+
+    The model's tree decoder is essentially a classifier over this vocabulary,
+    so the vocabulary must contain every cluster the model might ever emit. We
+    decompose each training molecule and union together all the cluster labels.
+    """
     from tqdm import tqdm
-    cluster_smiles = set()
+    cluster_smiles = set()   # a set automatically de-duplicates repeated clusters
     skipped = 0
     for smi in tqdm(smiles_list, desc="Building vocab"):
         try:
@@ -173,8 +203,8 @@ def build_vocab(smiles_list: List[str]) -> Vocab:
             for node in tree.nodes:
                 cluster_smiles.add(node.smiles)
         except Exception:
-            skipped += 1   # skip molecules that still fail after kekulize guard
+            skipped += 1   # skip molecules that still fail after the kekulize guard
     if skipped:
         print(f"[vocab] Skipped {skipped} molecules during vocab building.")
-    # Sort for reproducibility across runs
+    # Sort so the index assignment is identical across runs (reproducibility).
     return Vocab(sorted(cluster_smiles))

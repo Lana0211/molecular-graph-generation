@@ -160,8 +160,11 @@ def internal_diversity(smiles_list: List[str], n_jobs: int = 1,
     valid = get_valid(smiles_list)
     if len(valid) < 2:
         return 0.0
+    # Subsample first: comparing every pair is O(n²), so cap n for tractability.
     if len(valid) > sample_size:
         valid = list(np.random.default_rng(42).choice(valid, sample_size, replace=False))
+    # Fingerprint each molecule, then average Tanimoto over all unique pairs
+    # (j > i avoids comparing a molecule to itself and double-counting).
     fps  = [morgan_fp(get_mol(s)) for s in valid]
     sims = [tanimoto(fps[i], fps[j])
             for i in range(len(fps)) for j in range(i + 1, len(fps))]
@@ -183,17 +186,27 @@ def snn(generated: List[str], reference: List[str],
         gen_valid = list(np.random.default_rng(0).choice(gen_valid, sample_size, replace=False))
     gen_fps  = [morgan_fp(get_mol(s)) for s in gen_valid]
     ref_fps  = [morgan_fp(get_mol(s)) for s in ref_valid[:sample_size]]
-    # For each generated molecule find its most similar reference molecule
+    # For each generated molecule, BulkTanimotoSimilarity scores it against every
+    # reference fingerprint at once; max() takes its single nearest neighbour.
+    # Averaging those nearest-neighbour similarities gives the SNN.
     max_sims = [max(DataStructs.BulkTanimotoSimilarity(gfp, ref_fps)) for gfp in gen_fps]
     return float(np.mean(max_sims))
 
 
 def scaffold_similarity(generated: List[str], reference: List[str]) -> float:
-    """Fraction of generated Murcko scaffolds that also appear in the reference set."""
+    """Fraction of generated Murcko scaffolds that also appear in the reference set.
+
+    A Murcko scaffold is the molecule's ring-system core with side chains
+    stripped off. Comparing scaffold *sets* asks: of the distinct core skeletons
+    we generated, how many also occur in real molecules? Low values mean the
+    model invented core skeletons not present in the reference set.
+    """
+    # Reduce each molecule to its scaffold and collect the distinct ones.
     gen_scaffolds = set(get_scaffold(s) for s in get_valid(generated)) - {None}
     ref_scaffolds = set(get_scaffold(s) for s in get_valid(reference)) - {None}
     if not gen_scaffolds:
         return 0.0
+    # |intersection| / |generated scaffolds| = overlap fraction.
     return len(gen_scaffolds & ref_scaffolds) / len(gen_scaffolds)
 
 
@@ -229,12 +242,16 @@ def compute_fcd(generated: List[str], reference: List[str],
         if not gen_valid or not ref_valid:
             return float("nan")
 
+        # ChemNet is a pretrained network; we run both molecule sets through it
+        # to get activation vectors that summarise their chemical features.
         model = fcd.load_ref_model()
         # n_jobs=1 keeps prediction single-process (no Pool); device='cpu' is safe
         gen_act = fcd.get_predictions(model, gen_valid, n_jobs=1, device=device)
         ref_act = fcd.get_predictions(model, ref_valid, n_jobs=1, device=device)
 
-        # Fréchet distance between the two activation Gaussians
+        # Model each activation set as a Gaussian (mean + covariance) and measure
+        # the Fréchet distance between them. 0 = identical distributions; larger
+        # = the generated set's chemistry drifts further from the reference.
         score = fcd.calculate_frechet_distance(
             mu1=gen_act.mean(0), sigma1=np.cov(gen_act.T),
             mu2=ref_act.mean(0), sigma2=np.cov(ref_act.T),

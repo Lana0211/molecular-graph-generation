@@ -78,7 +78,8 @@ def gradient_ascent(
     device = z_init.device
     model.eval()
 
-    # Decode initial seed to get (z, QED) pairs for proxy training
+    # Step 1: decode the seed latents and score them, giving (z, QED) pairs that
+    # the proxy network will learn from.
     print("[opt] Collecting seed scores ...")
     seed_smiles = model._decode_z(z_init, temperature=temperature)
     seed_scores = score_smiles(seed_smiles)
@@ -86,7 +87,9 @@ def gradient_ascent(
     z_np  = z_init.detach().cpu().numpy()
     y_np  = np.array(seed_scores, dtype=np.float32)
 
-    # Train a simple 2-layer proxy
+    # Step 2: train a small differentiable proxy z → QED. Sigmoid bounds the
+    # output to [0, 1], matching QED's range. This proxy stands in for the real
+    # (non-differentiable) QED so we can take gradients w.r.t. z.
     proxy = torch.nn.Sequential(
         torch.nn.Linear(model.latent_dim, 128),
         torch.nn.ReLU(),
@@ -96,14 +99,15 @@ def gradient_ascent(
     opt_proxy = torch.optim.Adam(proxy.parameters(), lr=1e-3)
     z_t = z_init.detach()
     y_t = torch.tensor(y_np, device=device).unsqueeze(1)
-    for _ in range(200):
+    for _ in range(200):   # fit the proxy by regressing predicted QED onto true QED
         opt_proxy.zero_grad()
         pred = proxy(z_t)
         loss = torch.nn.functional.mse_loss(pred, y_t)
         loss.backward()
         opt_proxy.step()
 
-    # Gradient ascent on z
+    # Step 3: ascend the proxy's gradient. z_opt is now the thing being optimised
+    # (requires_grad), while the proxy weights are frozen.
     z_opt = z_init.clone().detach().requires_grad_(True)
     optimiser = torch.optim.Adam([z_opt], lr=lr)
     records = []
@@ -112,9 +116,13 @@ def gradient_ascent(
     for step in range(n_steps):
         optimiser.zero_grad()
         score = proxy(z_opt).mean()
+        # Optimisers minimise, so minimising -score maximises predicted QED,
+        # nudging z toward regions the proxy believes are more drug-like.
         (-score).backward()
         optimiser.step()
 
+        # Every 20 steps, decode the current z and measure the *true* QED so we
+        # can track whether proxy gains translate into real improvements.
         if step % 20 == 0:
             with torch.no_grad():
                 smiles_list = model._decode_z(z_opt.detach(), temperature=temperature)
@@ -161,30 +169,35 @@ def bayesian_opt(
         n_restarts_optimizer=n_restarts,
     )
 
+    # Seed the record log with the initial observations (iteration -1).
     records = []
     for i, (smi, sc) in enumerate(zip(smiles_init, y_np)):
         records.append({"iteration": -1, "smiles": smi, "qed": float(sc)})
 
     print(f"[BO] Starting {n_iter} BO iterations ...")
     for it in range(n_iter):
+        # Refit the GP surrogate on all observations gathered so far.
         gp.fit(z_np, y_np)
 
-        # Expected Improvement acquisition
+        # Expected Improvement (EI): score random candidate latents by how much
+        # they are expected to beat the best QED seen, balancing high predicted
+        # mean (mu) against uncertainty (sigma) — i.e. exploit vs. explore.
         best_y = y_np.max()
         z_candidates = np.random.randn(500, z_np.shape[1])
         mu, sigma = gp.predict(z_candidates, return_std=True)
-        imp   = mu - best_y - 0.01
-        Z     = imp / (sigma + 1e-9)
+        imp   = mu - best_y - 0.01          # predicted improvement over current best
+        Z     = imp / (sigma + 1e-9)        # standardised improvement
         from scipy.stats import norm
         ei    = imp * norm.cdf(Z) + sigma * norm.pdf(Z)
-        next_z = z_candidates[np.argmax(ei)]
+        next_z = z_candidates[np.argmax(ei)]   # pick the most promising candidate
 
+        # Evaluate the true QED at the chosen latent and add it to the dataset.
         z_t   = torch.tensor(next_z, dtype=torch.float, device=device).unsqueeze(0)
         new_smi = model._decode_z(z_t, temperature=temperature)
         new_sc  = score_smiles(new_smi)[0]
 
-        z_np  = np.vstack([z_np,   next_z])
-        y_np  = np.append(y_np,  new_sc)
+        z_np  = np.vstack([z_np,   next_z])   # append the new observation so the
+        y_np  = np.append(y_np,  new_sc)      # GP improves on the next iteration
 
         records.append({"iteration": it, "smiles": new_smi[0], "qed": new_sc})
         if it % 10 == 0:
